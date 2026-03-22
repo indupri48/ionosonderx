@@ -14,8 +14,13 @@
 
 #define PI 3.1415
 
+// Chirp parameters
+const float f_low = 0.0;
+const float f_high = 3000.0;
+const float chirp_rate = 10000.0;
+
 // Audio sample input buffer
-#define INBUF_LENGTH 65536
+#define INBUF_LENGTH (65536 * 8)
 #define INBUF_BLOCK_LENGTH 4096 
 unsigned int inbuf_write_index = 0;
 unsigned int inbuf_read_index = 0;
@@ -41,17 +46,10 @@ PaStreamParameters input_parameters;
 PaStreamParameters output_parameters;
 PaStreamFlags stream_flags;
 
+/*
+This is the audio callback function for the real-time mode
+*/
 static int audio_callback(const void *input_buffer, void *output_buffer, unsigned long n_samples, const PaStreamCallbackTimeInfo* time_info, PaStreamCallbackFlags flags, void *context) {
-
-    // if(input_buffer == NULL) return paContinue;
-    // if(output_buffer == NULL) return paContinue;
-    // int a = flags & paInputUnderflow;
-    // int b = flags & paInputOverflow;
-    // int c = flags & paOutputUnderflow;
-    // int d = flags & paOutputOverflow;
-
-    // printf("%i %i %i %i\n", a, b, c, d);
-    // fflush(stderr);
 
     // Push this block of samples to the circular buffer and also the output stream
     float *in_samples = (float *)input_buffer;
@@ -74,12 +72,17 @@ static int audio_callback(const void *input_buffer, void *output_buffer, unsigne
 
 void main(int argc, char **argv) {
 
-    FILE *out_file = fopen("data/out.dat", "wb");
-
     // Initialise the program
 
+    FILE *out_file = fopen("data/out.dat", "wb");
+
+    // Create the ring buffer for samples
+    // This is technically not required for non real-time modes because the file is our buffer.
+    // However, it is needed to track past samples for captures in all cases.
+    in_buffer = malloc(INBUF_LENGTH * sizeof(float));
+
     // Initialise the matched filter
-    matched_filter_create(0, 3000, 10000, (float)AUDIO_RATE);
+    matched_filter_create(f_low, f_high, chirp_rate, (float)AUDIO_RATE);
 
     // Initialise the matched filter output buffer
     mf_buffer = malloc(MFBUF_LENGTH * sizeof(float));
@@ -102,9 +105,6 @@ void main(int argc, char **argv) {
 
         // No argument provided. Assume the user wants to run in real tim
         printf("The program will run in mode: real-time\n");
-
-        // Create the ring buffer for samples
-        in_buffer = malloc(INBUF_LENGTH * sizeof(float));
 
         // Open the audio stream
 	    PaError pa_err;
@@ -170,9 +170,17 @@ void main(int argc, char **argv) {
         float mf_output[n_samples];
 
         if(sample_file != NULL) {
+
             // Simply read the next float. The file is our buffer
             size_t n_bytes_read = fread(mf_input, sizeof(float), n_samples, sample_file);
             if(n_bytes_read != n_samples) break;
+
+            // Also write these samples to the input buffer to be able to capture them later
+            printf("wi: %i %i\n", inbuf_write_index, n_samples);
+            memcpy(in_buffer + inbuf_write_index, mf_input, n_samples * sizeof(float));
+            inbuf_write_index = (inbuf_write_index + n_samples) % INBUF_LENGTH;
+            
+
         } else {
 
             // Wait for there to be at least n_samples available to read in the buffer
@@ -195,7 +203,7 @@ void main(int argc, char **argv) {
 
             int cut_index = (mfbuf_write_index - N_GUARD_CELLS - N_TRAINING_CELLS + MFBUF_LENGTH) % MFBUF_LENGTH;
 
-            // Work out the mea\n noise from the training cells
+            // Work out the mean noise from the training cells
             float noise = 0.0;
             for(int j = 0; j < N_TRAINING_CELLS; j++) {
                 int k = (cut_index + 1 + N_GUARD_CELLS + j) % MFBUF_LENGTH;
@@ -214,7 +222,7 @@ void main(int argc, char **argv) {
             fclose(t);
             
             if(cell_under_test >= a) {
-                
+
                 // This sample is likely enough to be a hit
                 
                 // A peak may be several samples wide. Find the maximum point.
@@ -224,8 +232,9 @@ void main(int argc, char **argv) {
                     searching = 1;
                     last_cut = 0; // any actual matched filter is non-negative
                 }
-                
+                // printf("%f %f\n", cell_under_test, last_cut);
                 if(searching != 2 && cell_under_test < last_cut) {
+                    
                     // The PREVIOUS cell was the peak. Make a capture now
                     // TODO this algorithm is really susceptable to noise
                     float d = (float)(c - 1);
@@ -234,7 +243,7 @@ void main(int argc, char **argv) {
                     fwrite(&last_cut, 4, 1, t);
                     fclose(t);
                     searching = 2;
-
+                    
                     if(sample_file == NULL) {
                         // Report the time the chirp was reported. The DSP means the chirp will have happened slightly sooner but ignore this delay for now
                         // This only really makes sense for the real-time mode of this program
@@ -243,7 +252,27 @@ void main(int argc, char **argv) {
                         struct tm tm = *localtime(&t);
                         printf("Detected a chirp at %d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
+                    } else {
+
+                        printf("Detected a chirp\n");
+
                     }
+
+                    // Save a capture of the samples which gave this peak
+
+                    // Determine how far back the samples are in the input buffer
+                    int filter_length = matched_filter_length();
+                    int last_cut_index = c - 1;
+                    int start_index = last_cut_index - N_TRAINING_CELLS - N_GUARD_CELLS - filter_length;
+                    start_index = (start_index + INBUF_LENGTH) % INBUF_LENGTH;
+                    printf("Start: %i\n", start_index);
+
+                    // Dump the samples to the capture file
+                    float buffer[filter_length];
+                    memcpy(buffer, in_buffer + start_index, filter_length * sizeof(float));
+                    FILE *capture_file = fopen("data/capture.dat", "wb");
+                    fwrite(buffer, filter_length, sizeof(float), capture_file);
+                    fclose(capture_file);
 
                 }
 

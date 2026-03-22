@@ -107,6 +107,12 @@ void matched_filter_destroy() {
 
 }
 
+int matched_filter_length() {
+
+    return filter_length;
+    
+}
+
 int get_n_input_samples() {
 
     return fft_length - (filter_length - 1);
